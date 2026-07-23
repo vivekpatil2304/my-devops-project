@@ -1,4 +1,4 @@
-name: CI/CD Pipeline
+name: Build and Deploy to EC2
 
 on:
   push:
@@ -7,43 +7,37 @@ on:
 
 jobs:
   deploy:
-    name: Build, Push and Deploy
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout Source Code
         uses: actions/checkout@v4
 
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
+      - name: Copy Files to EC2
+        uses: appleboy/scp-action@v0.1.7
         with:
-          username: ${{ secrets.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_PASSWORD }}
+          host: ${{ secrets.EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}
+          source: "."
+          target: "/home/ubuntu/my-devops-project"
 
-      - name: Build Docker Image
-        run: |
-          docker build -t ${{ secrets.DOCKER_USERNAME }}/mywebsite:latest .
-
-      - name: Push Docker Image
-        run: |
-          docker push ${{ secrets.DOCKER_USERNAME }}/mywebsite:latest
-
-      - name: Deploy to AWS EC2
+      - name: Build and Deploy on EC2
         uses: appleboy/ssh-action@v1.2.0
         with:
           host: ${{ secrets.EC2_HOST }}
-          username: ${{ secrets.EC2_USERNAME }}
+          username: ubuntu
           key: ${{ secrets.EC2_SSH_KEY }}
           script: |
-            docker pull ${{ secrets.DOCKER_USERNAME }}/mywebsite:latest
+            cd /home/ubuntu/my-devops-project
 
             docker stop mywebsite || true
             docker rm mywebsite || true
 
-            docker image prune -f
+            docker build -t mywebsite .
 
             docker run -d \
               --name mywebsite \
-              -p 80:80 \
               --restart unless-stopped \
-              ${{ secrets.DOCKER_USERNAME }}/mywebsite:latest
+              -p 80:80 \
+              mywebsite
