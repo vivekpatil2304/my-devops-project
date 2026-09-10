@@ -1,0 +1,325 @@
+name: CI/CD Blue-Green Deployment
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  AWS_REGION: ap-south-1
+  ECR_REPOSITORY: my-devops-project
+
+jobs:
+
+  # =====================================================
+  # CI - BUILD & PUSH IMAGE TO ECR
+  # =====================================================
+
+  build:
+    name: Build and Push Docker Image
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build Docker Image
+        run: |
+          docker build \
+            -t ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }} .
+
+      - name: Push Docker Image
+        run: |
+          docker push \
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+
+
+  # =====================================================
+  # CD - BLUE GREEN DEPLOYMENT
+  # =====================================================
+
+  deploy:
+    name: Deploy to EC2
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Deploy to EC2
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+
+          host: ${{ secrets.EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}
+
+          script: |
+
+            set -e
+
+            echo "================================="
+            echo "Starting Blue-Green Deployment"
+            echo "================================="
+
+            AWS_REGION="${{ env.AWS_REGION }}"
+            ECR_REPOSITORY="${{ env.ECR_REPOSITORY }}"
+            IMAGE_TAG="${{ github.sha }}"
+
+            AWS_ACCOUNT_ID=$(aws sts get-caller-identity \
+              --query Account \
+              --output text)
+
+            ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+
+            IMAGE="${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+
+            echo "Image:"
+            echo "$IMAGE"
+
+
+            # =============================================
+            # LOGIN TO ECR
+            # =============================================
+
+            echo "Logging into ECR..."
+
+            aws ecr get-login-password \
+              --region "$AWS_REGION" | \
+              docker login \
+              --username AWS \
+              --password-stdin "$ECR_REGISTRY"
+
+
+            # =============================================
+            # PULL NEW IMAGE
+            # =============================================
+
+            echo "Pulling Docker image..."
+
+            docker pull "$IMAGE"
+
+
+            # =============================================
+            # DETERMINE CURRENT ENVIRONMENT
+            # =============================================
+
+            if docker ps --format '{{.Names}}' | grep -q "^app-blue$"; then
+
+              CURRENT="blue"
+              NEW="green"
+
+              NEW_CONTAINER="app-green"
+              NEW_PORT="5002"
+
+              NEW_TARGET_GROUP="${{ secrets.GREEN_TARGET_GROUP_ARN }}"
+
+              OLD_CONTAINER="app-blue"
+
+            else
+
+              CURRENT="green"
+              NEW="blue"
+
+              NEW_CONTAINER="app-blue"
+              NEW_PORT="5001"
+
+              NEW_TARGET_GROUP="${{ secrets.BLUE_TARGET_GROUP_ARN }}"
+
+              OLD_CONTAINER="app-green"
+
+            fi
+
+
+            echo "Current environment: $CURRENT"
+            echo "New environment: $NEW"
+
+
+            # =============================================
+            # REMOVE OLD CONTAINER WITH SAME NAME
+            # =============================================
+
+            docker rm -f "$NEW_CONTAINER" 2>/dev/null || true
+
+
+            # =============================================
+            # START NEW CONTAINER
+            # =============================================
+
+            echo "Starting $NEW environment..."
+
+            docker run -d \
+              --name "$NEW_CONTAINER" \
+              -p "$NEW_PORT:5000" \
+              "$IMAGE"
+
+
+            # =============================================
+            # WAIT FOR APPLICATION
+            # =============================================
+
+            echo "Waiting for application..."
+
+            sleep 10
+
+
+            # =============================================
+            # HEALTH CHECK
+            # =============================================
+
+            echo "Running health check..."
+
+            for i in {1..10}; do
+
+              if curl -f "http://localhost:${NEW_PORT}/health"; then
+
+                echo ""
+                echo "Health check successful!"
+                break
+
+              fi
+
+              echo "Health check failed. Retry $i/10"
+
+              sleep 5
+
+              if [ "$i" -eq 10 ]; then
+
+                echo "Deployment failed!"
+
+                docker logs "$NEW_CONTAINER"
+
+                docker rm -f "$NEW_CONTAINER"
+
+                exit 1
+
+              fi
+
+            done
+
+
+            # =============================================
+            # REGISTER NEW CONTAINER WITH ALB
+            # =============================================
+
+            echo "Registering $NEW environment with ALB..."
+
+            INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+
+            aws elbv2 register-targets \
+              --target-group-arn "$NEW_TARGET_GROUP" \
+              --targets Id="$INSTANCE_ID",Port="$NEW_PORT"
+
+
+            # =============================================
+            # WAIT FOR ALB HEALTH CHECK
+            # =============================================
+
+            echo "Waiting for ALB health check..."
+
+            sleep 20
+
+
+            # =============================================
+            # VERIFY TARGET HEALTH
+            # =============================================
+
+            HEALTH=$(aws elbv2 describe-target-health \
+              --target-group-arn "$NEW_TARGET_GROUP" \
+              --targets Id="$INSTANCE_ID",Port="$NEW_PORT" \
+              --query 'TargetHealthDescriptions[0].TargetHealth.State' \
+              --output text)
+
+            echo "ALB target health: $HEALTH"
+
+
+            if [ "$HEALTH" != "healthy" ]; then
+
+              echo "ALB health check failed!"
+
+              docker logs "$NEW_CONTAINER"
+
+              aws elbv2 deregister-targets \
+                --target-group-arn "$NEW_TARGET_GROUP" \
+                --targets Id="$INSTANCE_ID",Port="$NEW_PORT"
+
+              docker rm -f "$NEW_CONTAINER"
+
+              exit 1
+
+            fi
+
+
+            # =============================================
+            # SWITCH ALB TRAFFIC
+            # =============================================
+
+            echo "Switching ALB traffic to $NEW..."
+
+            aws elbv2 modify-listener \
+              --listener-arn "${{ secrets.ALB_LISTENER_ARN }}" \
+              --default-actions Type=forward,TargetGroupArn="$NEW_TARGET_GROUP"
+
+
+            echo "================================="
+            echo "Traffic switched to $NEW"
+            echo "================================="
+
+
+            # =============================================
+            # WAIT AFTER SWITCH
+            # =============================================
+
+            sleep 10
+
+
+            # =============================================
+            # REMOVE OLD TARGET FROM ALB
+            # =============================================
+
+            OLD_PORT="5001"
+
+            if [ "$CURRENT" = "green" ]; then
+              OLD_PORT="5002"
+            fi
+
+
+            echo "Removing old target..."
+
+            aws elbv2 deregister-targets \
+              --target-group-arn "${{ secrets.${CURRENT^^}_TARGET_GROUP_ARN }}" \
+              --targets Id="$INSTANCE_ID",Port="$OLD_PORT" || true
+
+
+            # =============================================
+            # STOP OLD CONTAINER
+            # =============================================
+
+            echo "Stopping old container..."
+
+            docker rm -f "$OLD_CONTAINER" 2>/dev/null || true
+
+
+            # =============================================
+            # CLEAN OLD DOCKER IMAGES
+            # =============================================
+
+            docker image prune -f
+
+
+            echo "================================="
+            echo "Deployment Successful!"
+            echo "Active environment: $NEW"
+            echo "Image: $IMAGE"
+            echo "================================="
